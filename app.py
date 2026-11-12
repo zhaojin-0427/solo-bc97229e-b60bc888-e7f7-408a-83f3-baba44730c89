@@ -31,6 +31,7 @@ from flask import (
 from ingest import IngestError, run_ingest
 from publish import (
     PublishError,
+    acquire_current_snapshot,
     cleanup_incomplete,
     create_release,
     iter_snapshots,
@@ -521,6 +522,48 @@ def _valid_sample_id(sample_id: str) -> bool:
     return bool(SAMPLE_ID_RE.fullmatch(sample_id or ""))
 
 
+class _CloseHookedIterable:
+    """Wrap a response body iterable and run a callback when it is closed.
+
+    WSGI servers close the iterable returned for a response once the body
+    has been streamed or the client connection has dropped.  For file
+    responses (direct passthrough) that iterable is not the Flask response
+    object, so ``Response.call_on_close`` alone would not run on those
+    paths; wrapping the body iterable covers every server and every status.
+    """
+
+    __slots__ = ("_wrapped", "_on_close")
+
+    def __init__(self, wrapped, on_close) -> None:
+        self._wrapped = wrapped
+        self._on_close = on_close
+
+    def __iter__(self):
+        return iter(self._wrapped)
+
+    def __getitem__(self, key):
+        # Old-style iteration protocol used by some file wrappers.
+        return self._wrapped[key]
+
+    def close(self) -> None:
+        try:
+            close = getattr(self._wrapped, "close", None)
+            if close is not None:
+                close()
+        finally:
+            self._on_close()
+
+
+def _release_lease_on_close(response, leased):
+    """Release the download lease exactly once, however the response ends."""
+
+    response.call_on_close(leased.release)
+    body = response.response
+    if body is not None:
+        response.response = _CloseHookedIterable(body, leased.release)
+    return response
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     data_dir = Path(
         os.environ.get("DATA_DIR", str(BASE_DIR / "data"))
@@ -724,56 +767,73 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"error": "任务不存在"}), 404
         return jsonify(_job_payload(app, row))
 
-    def _download_snapshot(sample_id: str):
+    def _send_current_release_file(
+        sample_id: str, member: str, mimetype: str, download_name: str
+    ):
+        """Stream one file of the sample's currently published release.
+
+        The selected release is pinned for the whole transfer: retention
+        cleanup can never delete it out from under an in-flight download,
+        and the response always serves exactly the version that was selected
+        when the request arrived.  The lease is released when streaming
+        finishes or the client disconnects, after which deferred cleanup
+        reclaims the release if it is beyond the retention limit.
+        """
+
         if not _valid_sample_id(sample_id):
             abort(404)
-        snapshot = snapshot_for_sample(Path(app.config["PACKAGES_DIR"]), sample_id)
-        if snapshot is None:
+        leased = acquire_current_snapshot(
+            Path(app.config["PACKAGES_DIR"]), sample_id
+        )
+        if leased is None:
             abort(404)
-        return snapshot
+        try:
+            response = send_file(
+                getattr(leased.snapshot, member),
+                mimetype=mimetype,
+                as_attachment=True,
+                download_name=download_name,
+                conditional=True,
+            )
+        except Exception:
+            leased.release()
+            raise
+        return _release_lease_on_close(response, leased)
 
     @app.get("/samples/<sample_id>/download")
     def download_package(sample_id: str):
-        snapshot = _download_snapshot(sample_id)
-        return send_file(
-            snapshot.package_zip,
-            mimetype="application/zip",
-            as_attachment=True,
-            download_name=f"{sample_id}_package.zip",
-            conditional=True,
+        return _send_current_release_file(
+            sample_id,
+            "package_zip",
+            "application/zip",
+            f"{sample_id}_package.zip",
         )
 
     @app.get("/samples/<sample_id>/download/r1")
     def download_r1(sample_id: str):
-        snapshot = _download_snapshot(sample_id)
-        return send_file(
-            snapshot.r1_path,
-            mimetype="application/gzip",
-            as_attachment=True,
-            download_name=f"{sample_id}_R1.fastq.gz",
-            conditional=True,
+        return _send_current_release_file(
+            sample_id,
+            "r1_path",
+            "application/gzip",
+            f"{sample_id}_R1.fastq.gz",
         )
 
     @app.get("/samples/<sample_id>/download/r2")
     def download_r2(sample_id: str):
-        snapshot = _download_snapshot(sample_id)
-        return send_file(
-            snapshot.r2_path,
-            mimetype="application/gzip",
-            as_attachment=True,
-            download_name=f"{sample_id}_R2.fastq.gz",
-            conditional=True,
+        return _send_current_release_file(
+            sample_id,
+            "r2_path",
+            "application/gzip",
+            f"{sample_id}_R2.fastq.gz",
         )
 
     @app.get("/samples/<sample_id>/manifest")
     def download_manifest(sample_id: str):
-        snapshot = _download_snapshot(sample_id)
-        return send_file(
-            snapshot.manifest_path,
-            mimetype="application/json",
-            as_attachment=True,
-            download_name=f"{sample_id}_manifest.json",
-            conditional=True,
+        return _send_current_release_file(
+            sample_id,
+            "manifest_path",
+            "application/json",
+            f"{sample_id}_manifest.json",
         )
 
     @app.errorhandler(413)

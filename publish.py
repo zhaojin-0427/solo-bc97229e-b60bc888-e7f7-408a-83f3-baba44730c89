@@ -4,18 +4,29 @@ A release is fully built in its own directory and only made visible by an
 atomic symlink replacement.  The previously published release directory is
 kept in place, so an in-flight or repeat download of the old package continues
 to work while a replacement is being prepared.
+
+Downloads pin the release they have selected through a process-local lease
+registry.  Pruning never deletes a pinned release: deletion is deferred and
+runs as soon as the last in-flight download of that release finishes (or its
+client disconnects).  This closes the race where a request had already
+selected a complete release but had not opened its files yet when retention
+cleanup reclaimed them.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
 ZIP_NAME = "package.zip"
@@ -37,6 +48,142 @@ class PackageSnapshot(NamedTuple):
     r2_path: Path
     manifest_path: Path
     manifest: dict
+
+
+class _LeaseRegistry:
+    """Process-local pins that protect in-flight downloads from pruning.
+
+    The service runs as a single process (one Gunicorn worker; background
+    jobs are threads in that process), so a ``threading.Lock`` is enough to
+    serialise "resolve current release + pin it" against "prune decides to
+    delete a release".  The lock is only held while resolving and updating
+    counters — never while streaming a response or deleting files — so slow
+    downloads never block publishes or other samples.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._leases: dict[Path, int] = {}
+        # Directories prune wanted to delete but had to defer because they
+        # are pinned; deleted when the last lease is released.
+        self._pending: set[Path] = set()
+        # Directories currently being removed outside the lock.
+        self._trashing: set[Path] = set()
+
+    def lease_current(
+        self, sample_dir: Path, expected_sample_id: str | None
+    ) -> "LeasedSnapshot | None":
+        """Resolve the current release and pin it, atomically.
+
+        Returns ``None`` when no complete release is published.  Because the
+        resolution happens under the same lock that pruning uses to decide
+        deletions, a release handed out here can never be reclaimed before
+        the caller's lease is registered.
+        """
+
+        with self._lock:
+            snapshot = read_snapshot(sample_dir, expected_sample_id)
+            if snapshot is None:
+                return None
+            directory = snapshot.directory
+            if directory in self._trashing:
+                # Unreachable in practice (the current release is never a
+                # prune victim), but never hand out a half-deleted release.
+                return None
+            self._leases[directory] = self._leases.get(directory, 0) + 1
+        return LeasedSnapshot(self, snapshot)
+
+    def release(self, release_dir: Path) -> None:
+        """Drop one pin; run deferred cleanup when the last pin goes away."""
+
+        with self._lock:
+            count = self._leases.get(release_dir, 0)
+            if count > 1:
+                self._leases[release_dir] = count - 1
+                return
+            self._leases.pop(release_dir, None)
+            if release_dir not in self._pending:
+                return
+            self._pending.discard(release_dir)
+            self._trashing.add(release_dir)
+        self._remove(release_dir)
+
+    def remove_or_defer(self, release_dir: Path) -> bool:
+        """Delete ``release_dir`` now, or defer deletion while it is pinned."""
+
+        with self._lock:
+            if self._leases.get(release_dir, 0) > 0:
+                self._pending.add(release_dir)
+                logger.info(
+                    "下载进行中，延迟清理历史 release：%s", release_dir
+                )
+                return False
+            if release_dir in self._trashing:
+                return False
+            self._pending.discard(release_dir)
+            self._trashing.add(release_dir)
+        self._remove(release_dir)
+        return True
+
+    def _remove(self, release_dir: Path) -> None:
+        try:
+            shutil.rmtree(release_dir, ignore_errors=True)
+        finally:
+            with self._lock:
+                self._trashing.discard(release_dir)
+
+
+_LEASES = _LeaseRegistry()
+
+
+class LeasedSnapshot:
+    """A pinned view of one published release.
+
+    The pinned release directory cannot be reclaimed by retention cleanup
+    until :meth:`release` is called.  Use as a context manager or call
+    :meth:`release` exactly when the response has been fully sent or aborted;
+    the call is idempotent.
+    """
+
+    __slots__ = ("_registry", "snapshot", "_released")
+
+    def __init__(self, registry: _LeaseRegistry, snapshot: PackageSnapshot) -> None:
+        self._registry = registry
+        self.snapshot = snapshot
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._registry.release(self.snapshot.directory)
+
+    def __enter__(self) -> "LeasedSnapshot":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        # Safety net: a WSGI server that never closes the response iterable
+        # must not pin a historical release forever.
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def acquire_current_snapshot(
+    packages_root: Path, sample_id: str
+) -> "LeasedSnapshot | None":
+    """Pin the sample's currently published release for an in-flight download.
+
+    The caller must release the returned lease once the download ends or the
+    client disconnects; historical releases pinned this way are reclaimed as
+    soon as the last lease on them is released.
+    """
+
+    return _LEASES.lease_current(Path(packages_root) / sample_id, sample_id)
 
 
 def utc_now_iso() -> str:
@@ -190,10 +337,9 @@ def prune_releases(sample_dir: Path, keep: int) -> None:
     for _, item in releases[keep:]:
         if current_name and item.name == current_name:
             continue
-        try:
-            shutil.rmtree(item)
-        except OSError:
-            pass
+        # A release pinned by an in-flight download is not deleted now;
+        # its cleanup runs when the last download lease is released.
+        _LEASES.remove_or_defer(item)
 
 
 def create_release(

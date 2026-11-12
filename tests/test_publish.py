@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 from publish import (
+    acquire_current_snapshot,
     cleanup_incomplete,
     create_release,
     prune_releases,
@@ -125,6 +126,100 @@ class PublishTest(unittest.TestCase):
         cleanup_incomplete(self.packages)
         self.assertTrue(published.directory.is_dir())
         self.assertFalse(incomplete.exists())
+
+
+class DownloadLeaseTest(unittest.TestCase):
+    """Pinned releases must survive retention cleanup until unpinned."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.packages = self.root / "packages"
+        self.work = self.root / "work"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _publish(self, job_char: str, label: str = "one"):
+        _make_work(self.work, label)
+        return create_release(
+            work_dir=self.work,
+            packages_root=self.packages,
+            sample_id="SAMPLE-1",
+            job_id=job_char * 32,
+            read_count=1,
+            r1_sha256="r1hash",
+            r2_sha256="r2hash",
+            keep_releases=2,
+        )
+
+    def test_acquire_without_release_returns_none(self) -> None:
+        self.assertIsNone(acquire_current_snapshot(self.packages, "SAMPLE-1"))
+
+    def test_leased_release_survives_prune_until_released(self) -> None:
+        first = self._publish("a", "first")
+        leased = acquire_current_snapshot(self.packages, "SAMPLE-1")
+        self.assertIsNotNone(leased)
+        self.assertEqual(leased.snapshot.release_id, first.release_id)
+
+        # KEEP_RELEASES=2: publishing B then C would prune A, but the
+        # in-flight download pinned it, so cleanup is deferred.
+        second = self._publish("b", "second")
+        third = self._publish("c", "third")
+        self.assertTrue(first.directory.is_dir())
+        self.assertTrue(second.directory.is_dir())
+        self.assertTrue(third.directory.is_dir())
+
+        # The pinned files remain fully readable while deferred.
+        self.assertTrue(leased.snapshot.package_zip.is_file())
+        self.assertTrue(leased.snapshot.manifest_path.is_file())
+
+        leased.release()
+        self.assertFalse(first.directory.exists())
+        self.assertTrue(second.directory.is_dir())
+        self.assertTrue(third.directory.is_dir())
+        # Releasing again is a harmless no-op.
+        leased.release()
+        self.assertTrue(second.directory.is_dir())
+
+    def test_new_lease_tracks_new_current_while_old_is_pinned(self) -> None:
+        first = self._publish("a", "first")
+        leased_first = acquire_current_snapshot(self.packages, "SAMPLE-1")
+        second = self._publish("b", "second")
+        leased_second = acquire_current_snapshot(self.packages, "SAMPLE-1")
+        self.assertEqual(leased_first.snapshot.release_id, first.release_id)
+        self.assertEqual(leased_second.snapshot.release_id, second.release_id)
+        leased_first.release()
+        leased_second.release()
+
+    def test_multiple_leases_on_same_release_delete_after_last(self) -> None:
+        first = self._publish("a", "first")
+        leased_one = acquire_current_snapshot(self.packages, "SAMPLE-1")
+        leased_two = acquire_current_snapshot(self.packages, "SAMPLE-1")
+        second = self._publish("b", "second")
+        third = self._publish("c", "third")
+
+        leased_one.release()
+        self.assertTrue(first.directory.is_dir())
+        leased_two.release()
+        self.assertFalse(first.directory.exists())
+        self.assertTrue(second.directory.is_dir())
+        self.assertTrue(third.directory.is_dir())
+
+    def test_lease_context_manager_releases(self) -> None:
+        first = self._publish("a", "first")
+        with acquire_current_snapshot(self.packages, "SAMPLE-1") as leased:
+            self.assertEqual(leased.snapshot.release_id, first.release_id)
+            self._publish("b", "second")
+            self._publish("c", "third")
+            self.assertTrue(first.directory.is_dir())
+        self.assertFalse(first.directory.exists())
+
+    def test_unleased_old_release_is_pruned_immediately(self) -> None:
+        first = self._publish("a", "first")
+        self._publish("b", "second")
+        self._publish("c", "third")
+        self.assertFalse(first.directory.exists())
 
 
 if __name__ == "__main__":
